@@ -1,0 +1,1 @@
+Namespace(data_device='cuda', eval=False, images='images', model_path='./output/2ca7d1da-8', resolution=-1, sh_degree=3, source_path='/home/bbsplat/data/demo2', white_background=False)

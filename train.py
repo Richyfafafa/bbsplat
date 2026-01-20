@@ -88,7 +88,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         ssim_map = ssim(image, gt_image, size_average=False)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_map.mean())
-        
+               # === B样条控制点平滑正则化 ===
+        if gaussians.get_control_points_z.numel() > 0:
+            ctrl = gaussians.get_control_points_z # [N, 1, 4, 4]
+            
+            # 1. Laplacian 平滑损失 (二阶差分)
+            # 沿 U 方向 (dim=2) 和 V 方向 (dim=3) 计算邻居差异
+            diff_u = ctrl[:, :, :-2, :] - 2 * ctrl[:, :, 1:-1, :] + ctrl[:, :, 2:, :]
+            diff_v = ctrl[:, :, :, :-2] - 2 * ctrl[:, :, :, 1:-1] + ctrl[:, :, :, 2:]
+            loss_smooth = (diff_u.pow(2).mean() + diff_v.pow(2).mean())
+            # 2. 幅度约束 (防止 Z 偏移过大导致穿模)
+            loss_magnitude = ctrl.pow(2).mean()
+            
+            # 动态权重：随着训练进行，允许更多弯曲
+            lambda_smooth = 0.005 # 原来 0.01
+            lambda_mag = 0.0001   # 原来 0.001
+            
+            loss += lambda_smooth * loss_smooth + lambda_mag * loss_magnitude
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
@@ -108,6 +124,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss = loss + dist_loss + normal_loss + textures_reg
         # For MCMC sampler
         total_loss += opt.opacity_reg * gaussians.get_texture_alpha.mean()
+        #loss.backward()
         total_loss.backward()
 
         iter_end.record()

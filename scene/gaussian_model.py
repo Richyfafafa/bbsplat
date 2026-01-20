@@ -67,6 +67,8 @@ class GaussianModel:
         self._gaussians_is_active = True
         self._texture_preproc = texture_preproc
         self.setup_functions()
+        self._control_points_z = torch.empty(0) # [N, 1, 4, 4]
+        self.control_points_lr_scale = 1.0 # 学习率缩放t
 
         image = cv2.imread("assets/alpha_init_gaussian_small.png")[..., 0] / 255.0
         self._texture_alpha_init = torch.tensor([image], dtype=torch.float, device="cuda")
@@ -121,8 +123,31 @@ class GaussianModel:
     
     @property
     def get_xyz(self):
-        return self._xyz
-
+        # -----------------------------------------------------------
+        # [FIX] 建立控制点到位置的梯度连接
+        # -----------------------------------------------------------
+        if self._control_points_z.shape[0] > 0:
+            # 计算每个 Gaussian 的平均 Z 偏移
+            # _control_points_z shape: [N, 1, 4, 4]
+            # keepdim=True -> [N, 1, 1, 1]
+            mean_z = torch.tanh(self._control_points_z).mean(dim=(1, 2, 3), keepdim=True) * 0.1
+            
+            # 获取旋转矩阵 [N, 3, 3]
+            R = build_rotation(self._rotation)
+            
+            # 构造局部 Z 轴方向向量 [N, 3, 1]
+            local_offset = torch.zeros((self._xyz.shape[0], 3, 1), device="cuda")
+            
+            # [修正点] 使用 .view(-1) 将 mean_z 展平为 [N]，以匹配切片维度
+            local_offset[:, 2, 0] = mean_z.view(-1)
+            
+            # 旋转到世界坐标 [N, 3, 1]
+            world_offset = torch.bmm(R, local_offset).squeeze(2)
+            
+            # 叠加到中心位置
+            return self._xyz + world_offset * 0.1
+        else:
+            return self._xyz
     @property
     def get_features_first(self):
         return self._features_dc[:, :3]
@@ -146,6 +171,10 @@ class GaussianModel:
             return self._texture_color
         else:
             return self.color_activation(self._texture_color)
+
+    @property
+    def get_control_points_z(self):
+        return self._control_points_z
 
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -194,7 +223,7 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color - 0.1
         features[:, 3:, 1:] = 0.0
-
+        control_points_z = torch.zeros((fused_point_cloud.shape[0], 1, 4, 4), dtype=torch.float, device="cuda")
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(total_points).float().cuda()), 0.0000001)
@@ -220,6 +249,7 @@ class GaussianModel:
         texture_color = texture_color.type(torch.float)
         texture_color = self.inverse_color_activation(texture_color.to("cuda"))
         self._texture_color = nn.Parameter(texture_color.requires_grad_(True))
+        self._control_points_z = nn.Parameter(control_points_z.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -234,6 +264,8 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._texture_alpha], 'lr': 0, "name": "texture_alpha"},
             {'params': [self._texture_color], 'lr': 0, "name": "texture_color"},
+            # 新增控制点参数，学习率可以给小一点，比如 0.001
+            {'params': [self._control_points_z], 'lr': 0.001 * self.spatial_lr_scale, "name": "control_points"},
         ]
         self._texture_opacity_lr = training_args.texture_opacity_lr
         self._texture_color_lr = training_args.texture_color_lr
@@ -441,21 +473,23 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
-            extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
+            group_name = group["name"]
+            extension_tensor = tensors_dict.get(group_name)
 
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0).contiguous()
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0).contiguous()
+            if extension_tensor is not None:
+                stored_state = self.optimizer.state.get(group['params'][0], None)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+                    stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).contiguous().requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                    del self.optimizer.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                    self.optimizer.state[group['params'][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).contiguous().requires_grad_(True))
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    optimizable_tensors[group_name] = group["params"][0]
+                else:
+                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                    optimizable_tensors[group_name] = group["params"][0]
 
         return optimizable_tensors
 
@@ -467,7 +501,8 @@ class GaussianModel:
         "rotation" : new_rotation,
         "texture_color": new_color_tex,
         "texture_alpha": new_alpha_tex}
-
+        if hasattr(self, '_control_points'):
+            d["control_points"] = self._control_points
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -611,3 +646,49 @@ class GaussianModel:
         self._rotation = self._rotation[valid_points_mask]
         self._texture_color = self._texture_color[valid_points_mask]
         self._texture_alpha = self._texture_alpha[valid_points_mask]
+    def _subdivide_bspline(self):
+        """
+        将每个B样条Billboard细分为 split_size x split_size 个小平面的关键函数
+        """
+        # 假设细分等级为 2x2
+        S = 2 
+        N = self._xyz.shape[0]
+        
+        # 1. 生成局部 UV 网格 (N, S*S, 2)
+        # 范围 [-1, 1]
+        u = torch.linspace(-1, 1, S+1, device="cuda")
+        v = torch.linspace(-1, 1, S+1, device="cuda")
+        # 取网格中心作为小平面中心
+        u_center = (u[:-1] + u[1:]) / 2
+        v_center = (v[:-1] + v[1:]) / 2
+        v_grid, u_grid = torch.meshgrid(v_center, u_center, indexing='ij')
+        uv_centers = torch.stack([u_grid, v_grid], dim=-1).reshape(1, -1, 2).expand(N, -1, -1) # [N, S*S, 2]
+        
+        # 2. 计算 B 样条深度偏移 Z (N, S*S, 1)
+        # 这里为了简化，我们用双线性插值模拟 B 样条求值
+        # control_points_z: [N, 1, 4, 4]
+        # grid_sample 需要归一化到 [-1, 1] 的 grid
+        grid = uv_centers.unsqueeze(2) # [N, S*S, 1, 2]
+        # 注意：grid_sample 的 grid 坐标是 (x, y)，对应我们这里的 (u, v)
+        z_offsets = F.grid_sample(self._control_points_z, grid, mode='bilinear', align_corners=True) # [N, 1, S*S, 1]
+        z_offsets = z_offsets.squeeze(-1).permute(0, 2, 1) # [N, S*S, 1]
+        
+        # 3. 计算世界坐标
+        # P_world = P_center + R * (S * [u, v, z])
+        # 构建旋转矩阵
+        rots = build_rotation(self._rotation) # [N, 3, 3]
+        
+        # 构建局部坐标向量 [u*sx, v*sy, z]
+        scales = self.get_scaling # [N, 2]
+        local_pos = torch.cat([
+            uv_centers[:, :, 0:1] * scales[:, 0:1].unsqueeze(1),
+            uv_centers[:, :, 1:2] * scales[:, 1:2].unsqueeze(1),
+            z_offsets
+        ], dim=-1) # [N, S*S, 3]
+        
+        # 旋转并平移
+        # (N, 3, 3) @ (N, S*S, 3)^T -> (N, 3, S*S) -> (N, S*S, 3)
+        xyz_offsets = torch.bmm(rots, local_pos.transpose(1, 2)).transpose(1, 2)
+        new_xyz = self._xyz.unsqueeze(1) + xyz_offsets # [N, S*S, 3]
+        
+        return new_xyz.reshape(-1, 3)

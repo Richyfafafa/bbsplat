@@ -33,6 +33,8 @@ from utils.mesh_utils import GaussianExtractor, post_process_mesh
 from utils.render_utils import generate_path, create_videos, save_img_u8
 from utils.sh_utils import SH2RGB
 
+from bspline_billboard import bsplines_to_mesh, bspline_billboard_to_surface
+
 
 def unwrap_uvmap(mesh, device="cuda"):
     v_np = np.asarray(mesh.vertices)  # [N, 3]
@@ -193,6 +195,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_cluster", default=1000, type=int, help='Mesh: number of connected clusters to export')
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
     parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
+    parser.add_argument("--bspline_res", default=15, type=int, help="Export mesh resolution (higher = smoother)")
+    parser.add_argument("--bspline_degree", default=3, type=int, help="B-Spline degree")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
@@ -243,10 +247,21 @@ if __name__ == "__main__":
                     num_frames=n_fames)
 
     if args.save_planes:
-        # CONVERT TO SET OF PLANES
         prune_based_on_visibility(scene, gaussians, pipe, background)
-        billboards_to_mesh(gaussians, args.model_path)
-
+        
+        # [FIX] 使用参数化调用，并开启 use_control_points_from_gaussians
+        print("Exporting optimized B-Spline surfaces...")
+        bsplines_to_mesh(
+            gaussians, 
+            args.model_path,
+            resolution_u=args.bspline_res, 
+            resolution_v=args.bspline_res,
+            degree_u=args.bspline_degree, 
+            degree_v=args.bspline_degree,
+            num_control_points_u=4, 
+            num_control_points_v=4,
+            use_control_points_from_gaussians=True  # 关键：读取训练好的 _control_points_z
+        )
     if not args.skip_mesh:
         print("export mesh ...")
         os.makedirs(train_dir, exist_ok=True)
