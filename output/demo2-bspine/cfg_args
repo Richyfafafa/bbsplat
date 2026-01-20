@@ -1,1 +1,0 @@
-Namespace(data_device='cuda', eval=False, images='images', model_path='output/demo2-bspine/', resolution=-1, sh_degree=3, source_path='/home/bbsplat/data/demo2', white_background=False)
